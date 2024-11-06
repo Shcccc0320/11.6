@@ -35,27 +35,31 @@ class V2XEnvironment(gym.Env):
 
         # 基站配置 (0是MBS，1-4是SBS)
         self.base_stations = {
-            0: {'position': (1.5, 2.5), 'total_bandwidth': 300, 'transmission_power': 60},
-            1: {'position': (0.7, 2.2), 'total_bandwidth': 100, 'transmission_power': 30},
-            2: {'position': (2.3, 2.7), 'total_bandwidth': 100, 'transmission_power': 30},
-            3: {'position': (2.7, 1.2), 'total_bandwidth': 100, 'transmission_power': 30},
-            4: {'position': (1.2, 1.1), 'total_bandwidth': 100, 'transmission_power': 30}
+            0: {'position': (1.5, 2.5), 'total_bandwidth': 300, 'transmission_power': 80},
+            1: {'position': (0.7, 2.2), 'total_bandwidth': 100, 'transmission_power': 40},
+            2: {'position': (2.3, 2.7), 'total_bandwidth': 100, 'transmission_power': 40},
+            3: {'position': (2.7, 1.2), 'total_bandwidth': 100, 'transmission_power': 40},
+            4: {'position': (1.2, 1.1), 'total_bandwidth': 100, 'transmission_power': 40}
         }
 
-        self.noise_power = 1e-9  # 噪声功率
-        self.num_vehicles = 4    # 车辆数量
-        self.num_stations = 5    # 基站数量
+        self.noise_power = 1e-10  # 将噪声功率降低
 
-        # 定义QoS要求和惩罚因子
-        self.max_delay = 0.01             # URLLC最大可接受时延（秒）
-        self.min_rate = 10                # eMBB最小可接受数据率（Mbps）
-        self.delay_penalty_factor = 0.01   # 时延惩罚因子
-        self.rate_penalty_factor = 0.005   # 数据率惩罚因子
+        self.num_vehicles = 4  # Number of vehicles
+        self.num_stations = 5  # Number of base stations
 
-        # 定义状态空间归一化常数
-        self.max_position = 3.0  # 最大坐标值
-        self.max_data_requirement = 80.0  # 最大数据需求
-        self.max_bandwidth = 1000.0  # 最大带宽
+        # Total available bandwidth
+        self.total_available_bandwidth = 10e6 #10 MHz
+
+        # QoS requirements and penalty factors
+        self.max_delay = 0.01  # Maximum acceptable delay for URLLC (seconds)
+        self.min_rate = 10  # Minimum acceptable data rate for eMBB (Mbps)
+        self.delay_penalty_factor = 0.1  # Delay penalty factor
+        self.rate_penalty_factor = 0.05  # Data rate reward factor
+
+        # Normalization constants for state representation
+        self.max_position = 3.0  # Maximum coordinate value
+        self.max_data_requirement = 80.0  # Maximum data requirement
+        self.max_bandwidth = self.total_available_bandwidth  # Use total available bandwidth
 
         # Time step and step counter
         self.delta_t = 1.0  # Time step duration
@@ -117,11 +121,11 @@ class V2XEnvironment(gym.Env):
         for vehicle in self.state['vehicles'].values():
             slice_type = vehicle['slice_type']
             if slice_type == 'URLLC':
-                vehicle['data_requirement'] = np.random.uniform(20, 80)  # 数据大小 (Mbits)
+                vehicle['data_requirement'] = max(np.random.uniform(10, 80), 1e-3)  # 数据大小 (Mbits)
             elif slice_type == 'eMBB':
-                vehicle['data_requirement'] = np.random.uniform(40, 100)
+                vehicle['data_requirement'] = max(np.random.uniform(20, 100), 1e-3)
             elif slice_type == 'Both':
-                vehicle['data_requirement'] = np.random.uniform(20, 100)
+                vehicle['data_requirement'] = max(np.random.uniform(10, 100), 1e-3)
             vehicle['bandwidth_allocation'] = 0.0
 
         return self.get_state()
@@ -268,21 +272,23 @@ class V2XEnvironment(gym.Env):
             base_station_id = vehicle['base_station']
             slice_type = vehicle['slice_type']
 
-            # 计算数据率和时延
+            # Calculate data rate and delay
             datarate = self.calculate_datarate(vehicle_id, vehicle, base_station_id)
             delay = self.calculate_delay(vehicle_id, vehicle, base_station_id)
 
-            # 防止 NaN 或 Inf
+            # Prevent NaN or Inf
             if np.isnan(datarate) or np.isinf(datarate):
+                print(f"Warning: datarate for vehicle {vehicle_id} is NaN or Inf. Setting to 0.")
                 datarate = 0.0
             if np.isnan(delay) or np.isinf(delay):
-                delay = float('inf')
+                print(f"Warning: delay for vehicle {vehicle_id} is NaN or Inf. Setting to max_possible_delay.")
+                delay = self.max_delay * 10  # Set to a large but finite value
 
-            # 归一化
-            normalized_delay = delay / self.max_delay if self.max_delay > 0 else 0.0
+            # Normalize
+            normalized_delay = min(delay / self.max_delay if self.max_delay > 0 else 0.0, 10.0)  # Cap at 10
             normalized_datarate = datarate / self.min_rate if self.min_rate > 0 else 0.0
 
-            # 根据切片类型计算奖励，提供 shaped reward
+            # Compute reward based on slice type
             if slice_type == 'URLLC':
                 reward -= normalized_delay * self.delay_penalty_factor
                 if delay <= self.max_delay:
@@ -295,15 +301,16 @@ class V2XEnvironment(gym.Env):
                 reward -= normalized_delay * self.delay_penalty_factor
                 reward += normalized_datarate * self.rate_penalty_factor
                 if delay <= self.max_delay and datarate >= self.min_rate:
-                    reward += 2.0  # 满足两个要求，奖励更高
+                    reward += 2.0  # Higher reward for meeting both requirements
 
-        # 仅对奖励上限进行裁剪
+        # Clip reward to prevent excessively large values
         reward = np.clip(reward, -np.inf, 10)
         return reward
 
     def calculate_datarate(self, vehicle_id, vehicle, base_station_id):
         W_i_m = vehicle['bandwidth_allocation']  # Bandwidth allocated to the vehicle (Hz)
-        if W_i_m <= 1e-6 or base_station_id is None:
+        if W_i_m <= 1e-3 or base_station_id is None:
+            print(f"Vehicle {vehicle_id}: No or insufficient bandwidth allocated or not connected to a base station.")
             return 0.0  # No bandwidth allocated or not connected to a base station
 
         P = self.base_stations[base_station_id]['transmission_power']  # Transmission power (W)
@@ -312,74 +319,54 @@ class V2XEnvironment(gym.Env):
         Itm = self.calculate_interference(vehicle_id, base_station_id, vehicle['position'])
 
         sinr_denominator = sigma2 + Itm
-        if sinr_denominator <= 0:
-            sinr = 0.0
-        else:
-            sinr = (P * Gt_i_m) / sinr_denominator
+        sinr_denominator = max(sinr_denominator, 1e-9)  # Prevent division by zero
+        sinr = (P * Gt_i_m) / sinr_denominator
 
         sinr = max(sinr, 0.0)  # Ensure SINR is non-negative
 
         if sinr <= 0:
+            print(f"Vehicle {vehicle_id}: sinr <= 0. Setting datarate = 0")
             datarate = 0.0
         else:
             datarate = W_i_m * np.log2(1 + sinr)
 
         datarate_mbps = datarate / 1e6  # Convert to Mbps
 
+        # Print datarate and sinr
+        # print(f"Vehicle {vehicle_id}: sinr = {sinr}, datarate_mbps = {datarate_mbps}")
+        print(f"Vehicle {vehicle_id}: Gt_i_m = {Gt_i_m}, SINR = {sinr}")
+
         return datarate_mbps
 
     def calculate_delay(self, vehicle_id, vehicle, base_station_id):
         data_size = vehicle['data_requirement']  # Data size (Mbits)
         datarate_mbps = self.calculate_datarate(vehicle_id, vehicle, base_station_id)
-        if datarate_mbps <= 1e-6:
-            return float('inf')  # Zero data rate leads to infinite delay
+        if datarate_mbps <= 1e-3:
+            print(f"Vehicle {vehicle_id}: datarate_mbps too low. Setting delay to max_possible_delay.")
+            max_possible_delay = self.max_delay * 10  # Or another reasonable value
+            return max_possible_delay
 
         transmission_delay = data_size / datarate_mbps  # Delay (seconds)
+        # print(f"Vehicle {vehicle_id}: transmission_delay = {transmission_delay}")
+
         return transmission_delay
 
-
-
-
-    def calculate_channel_gain(self, vehicle_position, base_station_position):
-        # 频率和波长
-        frequency = 2e9  # 2 GHz
-        c = 3e8  # 光速
-        wavelength = c / frequency
-
-        d0 = 1.0  # 参考距离 (1 米)
-        path_loss_exponent = 3.5  # 路径损耗指数
-        distance = np.linalg.norm(np.array(vehicle_position) - np.array(base_station_position))
-        if distance < d0:
-            distance = d0
-
-        # 路径损耗
-        Lpath = (wavelength / (4 * np.pi * distance)) ** 2
-        Lpath *= (d0 / distance) ** path_loss_exponent
-        # 阴影衰落
-        Lshadow = 10 ** (- np.random.normal(0, 2) / 10)
-        # 小尺度衰落
-        Lfading = np.random.rayleigh(scale=1.0)
-
-        channel_gain = Lpath * Lshadow * Lfading
-        return channel_gain
+    def calculate_channel_gain(self, vehicle_position, bs_position):
+        distance = np.linalg.norm(np.array(vehicle_position) - np.array(bs_position))
+        distance = max(distance, 1e-3)
+        path_loss_exponent = 2.0  # 将路径损耗指数从 3.5 降低到 2.0
+        Gt_i_m = (1 / distance) ** path_loss_exponent
+        return Gt_i_m
 
     def calculate_interference(self, vehicle_id, base_station_id, vehicle_position):
         interference = 0.0
-        for other_base_station_id, other_base_station in self.base_stations.items():
-            if other_base_station_id != base_station_id:
-                P_other = other_base_station['transmission_power']
-                G_other = self.calculate_channel_gain(vehicle_position, other_base_station['position'])
-                interference += P_other * G_other
-            else:
-                # 同一基站其他车辆的干扰
-                for other_vehicle_id, other_vehicle in self.state['vehicles'].items():
-                    if other_vehicle_id != vehicle_id and other_vehicle['base_station'] == base_station_id:
-                        W_other = other_vehicle['bandwidth_allocation']
-                        if W_other <= 1e-6:
-                            continue
-                        P_other = self.base_stations[base_station_id]['transmission_power']
-                        G_other = self.calculate_channel_gain(vehicle_position, other_vehicle['position'])
-                        interference += P_other * G_other
+        for other_bs_id, other_bs in self.base_stations.items():
+            if other_bs_id != base_station_id:
+                # 可以考虑只计算相邻基站的干扰，或者引入干扰抑制机制
+                P = other_bs['transmission_power']
+                Gt_i_k = self.calculate_channel_gain(vehicle_position, other_bs['position'])
+                interference += P * Gt_i_k * interference_factor  # interference_factor 可设置为小于 1
+        interference = max(interference, 0.0)
         return interference
 
     def check_if_done(self):

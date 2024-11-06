@@ -6,31 +6,32 @@ import matplotlib.pyplot as plt
 from collections import deque
 import random
 
-# 确保正确导入 V2XEnvironment
+# Ensure that V2XEnvironment is correctly imported
 from env import V2XEnvironment
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Actor Network
 class Actor(nn.Module):
-    def __init__(self, state_dim, num_vehicles, num_stations):
+    def __init__(self, state_dim, num_vehicles, num_stations, total_bandwidth):
         super(Actor, self).__init__()
         self.num_vehicles = num_vehicles
         self.num_stations = num_stations
+        self.total_bandwidth = total_bandwidth
 
-        # 公共层
+        # Common layers
         self.common_layer1 = nn.Linear(state_dim, 256)
         self.norm1 = nn.LayerNorm(256)
         self.common_layer2 = nn.Linear(256, 256)
         self.norm2 = nn.LayerNorm(256)
 
-        # 基站选择（离散动作）
+        # Base station selection (discrete actions)
         self.base_station_layer = nn.Linear(256, num_vehicles * num_stations)
 
-        # 带宽分配（连续动作）
+        # Bandwidth allocation (continuous actions)
         self.bandwidth_layer = nn.Linear(256, num_vehicles)
 
-        # 初始化权重
+        # Initialize weights
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -43,17 +44,18 @@ class Actor(nn.Module):
         x = torch.relu(self.norm1(self.common_layer1(state)))
         x = torch.relu(self.norm2(self.common_layer2(x)))
 
-        # 基站选择的 logits
+        # Base station selection logits
         bs_logits = self.base_station_layer(x)
         bs_logits = bs_logits.view(-1, self.num_vehicles, self.num_stations)
 
-        # 减去最大值以获得数值稳定性
+        # Subtract max for numerical stability
         bs_logits = bs_logits - bs_logits.max(dim=-1, keepdim=True)[0]
 
         bs_probs = torch.softmax(bs_logits, dim=-1)
 
-        # 带宽分配，使用 sigmoid 激活函数
-        bandwidth = torch.sigmoid(self.bandwidth_layer(x))
+        # Bandwidth allocation
+        bandwidth_raw = self.bandwidth_layer(x)
+        bandwidth = torch.relu(bandwidth_raw)  # Ensure non-negative values
 
         return bs_probs, bandwidth
 
@@ -64,23 +66,23 @@ class Critic(nn.Module):
         self.num_vehicles = num_vehicles
         self.num_stations = num_stations
 
-        # 状态输入层
+        # State input layer
         self.state_layer = nn.Linear(state_dim, 256)
         self.norm1 = nn.LayerNorm(256)
 
-        # 动作输入层
+        # Action input layer
         action_input_dim = num_vehicles * (num_stations + 1)
         self.action_layer = nn.Linear(action_input_dim, 256)
         self.norm2 = nn.LayerNorm(256)
 
-        # 合并层
+        # Combined layers
         self.common_layer1 = nn.Linear(512, 256)
         self.norm3 = nn.LayerNorm(256)
         self.common_layer2 = nn.Linear(256, 256)
         self.norm4 = nn.LayerNorm(256)
         self.output_layer = nn.Linear(256, 1)
 
-        # 初始化权重
+        # Initialize weights
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -90,16 +92,16 @@ class Critic(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, state, bs_action_one_hot, bandwidth_action):
-        # 状态特征
+        # State feature
         state_feature = torch.relu(self.norm1(self.state_layer(state)))
 
-        # 动作特征
+        # Action feature
         bs_action_flat = bs_action_one_hot.view(-1, self.num_vehicles * self.num_stations)
         bandwidth_action_flat = bandwidth_action.view(-1, self.num_vehicles)
         action_input = torch.cat([bs_action_flat, bandwidth_action_flat], dim=1)
         action_feature = torch.relu(self.norm2(self.action_layer(action_input)))
 
-        # 合并特征
+        # Combined features
         x = torch.cat([state_feature, action_feature], dim=1)
         x = torch.relu(self.norm3(self.common_layer1(x)))
         x = torch.relu(self.norm4(self.common_layer2(x)))
@@ -108,28 +110,29 @@ class Critic(nn.Module):
 
 # DDPG Agent
 class DDPGAgent:
-    def __init__(self, state_dim, num_vehicles, num_stations):
+    def __init__(self, state_dim, num_vehicles, num_stations, total_bandwidth):
         self.num_vehicles = num_vehicles
         self.num_stations = num_stations
+        self.total_bandwidth = total_bandwidth
 
-        self.actor = Actor(state_dim, num_vehicles, num_stations).to(device)
-        self.actor_target = Actor(state_dim, num_vehicles, num_stations).to(device)
+        self.actor = Actor(state_dim, num_vehicles, num_stations, total_bandwidth).to(device)
+        self.actor_target = Actor(state_dim, num_vehicles, num_stations, total_bandwidth).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-5)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
 
         self.critic = Critic(state_dim, num_vehicles, num_stations).to(device)
         self.critic_target = Critic(state_dim, num_vehicles, num_stations).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-4)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3)
 
         self.replay_buffer = deque(maxlen=100000)
         self.batch_size = 64
         self.discount = 0.99
         self.tau = 0.005
 
-        # ε-贪心策略参数
-        self.epsilon = 1.0  # 初始探索率
-        self.epsilon_decay = 0.995
+        # ε-greedy exploration parameters
+        self.epsilon = 1.0  # Initial exploration rate
+        self.epsilon_decay = 0.999
         self.epsilon_min = 0.01
 
     def select_action(self, state, exploration=True):
@@ -138,29 +141,39 @@ class DDPGAgent:
             raise ValueError("State contains NaN or Inf")
 
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-        bs_probs, bandwidth = self.actor(state)
+        bs_probs, bandwidth_raw = self.actor(state)
 
         if torch.isnan(bs_probs).any() or torch.isinf(bs_probs).any():
             print("bs_probs contains NaN or Inf:", bs_probs)
             raise ValueError("bs_probs contains NaN or Inf")
 
         bs_probs = bs_probs.cpu().data.numpy().squeeze()
-        bandwidth = bandwidth.cpu().data.numpy().squeeze()
+        bandwidth = torch.relu(bandwidth_raw).cpu().data.numpy().squeeze()
+        bandwidth = bandwidth + 1e-6  # Prevent zeros
 
-        # 基站选择
+        # Base station selection
         if exploration and np.random.rand() < self.epsilon:
-            # 随机选择基站
+            # Randomly select base stations
             base_station_selection = np.random.randint(0, self.num_stations, size=self.num_vehicles)
         else:
-            # 贪心选择
+            # Greedy selection
             base_station_selection = np.argmax(bs_probs, axis=-1)
 
-        # 带宽分配，添加噪声以促进探索
+        # Normalize the bandwidth allocations
+        bandwidth_allocations = bandwidth / np.sum(bandwidth) * self.total_bandwidth
+
+        # Ensure minimum bandwidth per vehicle
+        min_bandwidth_per_vehicle = self.total_bandwidth * 0.05  # Adjust as needed
+        bandwidth_allocations = np.maximum(bandwidth_allocations, min_bandwidth_per_vehicle)
+
+        # Re-normalize
+        bandwidth_allocations = bandwidth_allocations / np.sum(bandwidth_allocations) * self.total_bandwidth
+        print(f"Episode {episode + 1}, Bandwidth allocations: {bandwidth_allocations}")
+        print(f"Episode {episode + 1}, Base station selection: {base_station_selection}")
+        # Exploration noise
         if exploration:
-            noise = np.random.normal(0, 0.2, size=bandwidth.shape)  # 增大噪声标准差
-            bandwidth_allocations = np.clip(bandwidth + noise, 0.0, 1.0)
-        else:
-            bandwidth_allocations = bandwidth
+            noise = np.random.normal(0, 0.05 * self.total_bandwidth, size=bandwidth_allocations.shape)
+            bandwidth_allocations = np.clip(bandwidth_allocations + noise, min_bandwidth_per_vehicle, self.total_bandwidth)
 
         action = (base_station_selection, bandwidth_allocations)
         return action
@@ -177,11 +190,11 @@ class DDPGAgent:
         next_state = torch.FloatTensor(np.array(next_state)).to(device)
         done = torch.FloatTensor(np.array(done)).unsqueeze(1).to(device)
 
-        # 处理动作
+        # Process actions
         base_station_selection = np.array([a[0] for a in action])
         bandwidth_allocations = np.array([a[1] for a in action])
 
-        # 将基站选择转换为 one-hot 编码
+        # Convert base station selection to one-hot encoding
         bs_action_one_hot = np.zeros((self.batch_size, self.num_vehicles, self.num_stations))
         for i in range(self.batch_size):
             for v in range(self.num_vehicles):
@@ -190,18 +203,26 @@ class DDPGAgent:
         bs_action_one_hot = torch.FloatTensor(bs_action_one_hot).to(device)
         bandwidth_action = torch.FloatTensor(bandwidth_allocations).to(device)
 
-        # Critic 训练
+        # Critic training
         with torch.no_grad():
-            next_bs_probs, next_bandwidth = self.actor_target(next_state)
+            next_bs_probs, next_bandwidth_raw = self.actor_target(next_state)
+            next_bandwidth = torch.relu(next_bandwidth_raw)
+            next_bandwidth = next_bandwidth + 1e-6
+            next_bandwidth_allocations = next_bandwidth / next_bandwidth.sum(dim=1, keepdim=True) * self.total_bandwidth
 
-            # 下一个基站的贪心选择
+            # Ensure minimum bandwidth per vehicle
+            min_bandwidth_per_vehicle = self.total_bandwidth * 0.05
+            next_bandwidth_allocations = torch.maximum(next_bandwidth_allocations, min_bandwidth_per_vehicle * torch.ones_like(next_bandwidth_allocations))
+            next_bandwidth_allocations = next_bandwidth_allocations / next_bandwidth_allocations.sum(dim=1, keepdim=True) * self.total_bandwidth
+
+            # Greedy selection for next base station
             next_base_station_selection = torch.argmax(next_bs_probs, dim=-1)
             next_bs_action_one_hot = nn.functional.one_hot(next_base_station_selection, num_classes=self.num_stations).float()
 
             next_bs_action_one_hot = next_bs_action_one_hot.to(device)
-            next_bandwidth = next_bandwidth.to(device)
+            next_bandwidth_allocations = next_bandwidth_allocations.to(device)
 
-            target_q = self.critic_target(next_state, next_bs_action_one_hot, next_bandwidth)
+            target_q = self.critic_target(next_state, next_bs_action_one_hot, next_bandwidth_allocations)
             target_q = reward + ((1 - done) * self.discount * target_q)
 
         current_q = self.critic(state, bs_action_one_hot, bandwidth_action)
@@ -216,14 +237,22 @@ class DDPGAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
-        # Actor 训练
-        bs_probs, bandwidth = self.actor(state)
+        # Actor training
+        bs_probs, bandwidth_raw = self.actor(state)
+        bandwidth = torch.relu(bandwidth_raw)
+        bandwidth = bandwidth + 1e-6
+        bandwidth_allocations = bandwidth / bandwidth.sum(dim=1, keepdim=True) * self.total_bandwidth
 
-        # 采样动作
+        # Ensure minimum bandwidth per vehicle
+        min_bandwidth_per_vehicle = self.total_bandwidth * 0.05
+        bandwidth_allocations = torch.maximum(bandwidth_allocations, min_bandwidth_per_vehicle * torch.ones_like(bandwidth_allocations))
+        bandwidth_allocations = bandwidth_allocations / bandwidth_allocations.sum(dim=1, keepdim=True) * self.total_bandwidth
+
+        # Sampled actions
         sampled_base_station_selection = torch.argmax(bs_probs, dim=-1)
         bs_action_one_hot = nn.functional.one_hot(sampled_base_station_selection, num_classes=self.num_stations).float()
 
-        actor_loss = -self.critic(state, bs_action_one_hot, bandwidth).mean()
+        actor_loss = -self.critic(state, bs_action_one_hot, bandwidth_allocations).mean()
 
         if torch.isnan(actor_loss) or torch.isinf(actor_loss):
             print("Actor loss is NaN or Inf")
@@ -234,14 +263,14 @@ class DDPGAgent:
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
 
-        # 更新目标网络
+        # Update target networks
         for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
         for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        # 衰减 ε
+        # Decay ε
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
@@ -250,13 +279,14 @@ class DDPGAgent:
     def add_to_replay_buffer(self, transition):
         self.replay_buffer.append(transition)
 
-# 训练代理
+# Training the agent
 env = V2XEnvironment()
 state_dim = env.observation_space.shape[0]
 num_vehicles = env.num_vehicles
 num_stations = env.num_stations
+total_bandwidth = env.total_available_bandwidth
 
-agent = DDPGAgent(state_dim, num_vehicles, num_stations)
+agent = DDPGAgent(state_dim, num_vehicles, num_stations, total_bandwidth)
 
 num_episodes = 5000
 all_rewards = []
@@ -275,7 +305,7 @@ for episode in range(num_episodes):
 
     while not done:
         action = agent.select_action(state)
-        # 可以选择记录动作
+        # Optionally, log the action
         # print(f"Episode {episode+1}, Step {step}, Action: {action}")
 
         next_state, reward, done, _ = env.step(action)
@@ -295,8 +325,8 @@ for episode in range(num_episodes):
     critic_losses.append(critic_loss)
     print(f"Episode: {episode + 1}, Reward: {episode_reward:.2f}, Actor Loss: {actor_loss:.4f}, Critic Loss: {critic_loss:.4f}")
 
-    # 每隔 100 个 episode 绘制一次结果
-    if (episode + 1) % 100 == 0:
+    # Plot results every 100 episodes
+    if (episode + 1) % 2500 == 0:
         plt.figure()
         plt.plot(all_rewards)
         plt.xlabel('Episode')
@@ -312,3 +342,4 @@ for episode in range(num_episodes):
         plt.title('Actor and Critic Losses')
         plt.legend()
         plt.show()
+
